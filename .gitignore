@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# venv
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# data — Master's own state
+data/journal.db
+data/journal.db-journal
+data/cache/
+
+# logs
+logs/
+*.log
+
+# build
+build/
+dist/
+*.egg-info/
+
+# tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db

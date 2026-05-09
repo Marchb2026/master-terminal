@@ -1,0 +1,7 @@
+[
+  {"name": "FOMC", "when": "2026-05-15T18:00:00", "impact": "high", "region": "US"},
+  {"name": "ECB", "when": "2026-05-22T13:45:00", "impact": "high", "region": "EU"},
+  {"name": "NFP", "when": "2026-06-06T13:30:00", "impact": "high", "region": "US"},
+  {"name": "CPI_US", "when": "2026-05-13T13:30:00", "impact": "high", "region": "US"},
+  {"name": "CPI_EU", "when": "2026-05-19T10:00:00", "impact": "medium", "region": "EU"}
+]
