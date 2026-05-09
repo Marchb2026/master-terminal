@@ -7,6 +7,7 @@ przez pojedyncze zewnętrzne zdarzenie.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
 from master.config import MasterConfig
@@ -43,12 +44,16 @@ def precheck(
     result = PrecheckResult(passed=True)
 
     # 1. Świeżość danych (Schwager Wizards: nie tradujesz na danych których nie ufasz)
+    # Diagnostic override: MASTER_SKIP_STALE=1 wyłącza ten gate (np. weekend, debug)
+    skip_stale = os.environ.get("MASTER_SKIP_STALE", "").strip() in ("1", "true", "yes")
     freshness = fs.check_freshness()
-    if not freshness.is_fresh:
+    if not freshness.is_fresh and not skip_stale:
         result.passed = False
         result.detail = f"stale data: {freshness.reason}"
         log.warning("Pre-check FAIL: %s", result.detail)
         return result
+    if not freshness.is_fresh and skip_stale:
+        log.warning("Pre-check WARN (skipped via MASTER_SKIP_STALE): %s", freshness.reason)
 
     # 2. Tail risk (Taleb): blackout window wokół eventów makro
     tail_status = tail.current_status()

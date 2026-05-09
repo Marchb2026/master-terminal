@@ -18,7 +18,7 @@ def test_imports():
     import master  # noqa
     from master import config  # noqa
     from master.core import (  # noqa
-        edge_lookup, gates, mtf, pipeline, plan, regime, setup_grader, sizer, verdict, wfa,
+        decision, edge_lookup, gates, mtf, pipeline, plan, regime, setup_grader, sizer, verdict, wfa,
     )
     from master.data import calendar, cot, ea_bridge, feature_store  # noqa
     from master.journal import db, importer, stats, trade  # noqa
@@ -179,6 +179,41 @@ def test_parse_ts_handles_all_formats():
     assert FeatureStore._parse_ts(None) is None
     assert FeatureStore._parse_ts("not a date") is None
     assert FeatureStore._parse_ts("") is None
+
+
+def test_weighted_decision_dataclass():
+    """WeightedDecision ma właściwe pola i defaults."""
+    from master.core.decision import WeightedDecision
+
+    wd = WeightedDecision(
+        direction="LONG",
+        weighted_score=0.7,
+        weighted_long=0.8,
+        weighted_short=0.1,
+    )
+    assert wd.direction == "LONG"
+    assert wd.weighted_score == 0.7
+    assert wd.contributing == {}
+    assert wd.fade_count == 0
+    assert wd.flat_skipped == 0
+
+
+def test_grade_from_score_mapping():
+    """Mapowanie weighted_score → SetupGrade w pipeline.
+    Granice: 1.0 → A, 0.5 → B, 0.3 → C, < 0.3 → NONE.
+    """
+    from master.core.pipeline import _grade_from_score
+    from master.core.verdict import SetupGrade
+
+    assert _grade_from_score(2.5) == SetupGrade.A
+    assert _grade_from_score(1.0) == SetupGrade.A
+    assert _grade_from_score(0.99) == SetupGrade.B
+    assert _grade_from_score(0.5) == SetupGrade.B
+    assert _grade_from_score(0.49) == SetupGrade.C
+    assert _grade_from_score(0.3) == SetupGrade.C
+    assert _grade_from_score(0.29) == SetupGrade.NONE
+    assert _grade_from_score(0.0) == SetupGrade.NONE
+    assert _grade_from_score(-0.5) == SetupGrade.NONE
 
 
 if __name__ == "__main__":
