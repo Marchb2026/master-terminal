@@ -1,16 +1,21 @@
 """Pipeline decyzyjny — orchestrator wszystkich kroków.
 
-Sekwencja:
-    1. gates.precheck            (events, psych, stale data)
-    2. regime.classify           (Clenow, Komar)
-    3. mtf.align                 (Elder)
-    4. setup_grader.grade        (Murphy, Komar)
-    5. edge_lookup.lookup        (Tharp)
-    6. sizer.size                (Tharp)
-    7. plan.build                (cut losses + asymmetric R:R)
+Sekwencja v0.4 (po commit #4 — pipeline integration):
+    1. gates.precheck            (events, psych, stale data)  — HARD GATE
+    2. weighted_decision         (PRIMARY: edge-aware confluence po fade)  ← główny krok
+    3. regime.classify           (informacyjnie, nie haltuje)
+    4. mtf.align                 (informacyjnie, nie haltuje)
+    5. sizer.size                (skip jeśli brak ATR/spot)
+    6. plan.build                (skip jeśli brak ATR/spot)
 
-Każdy krok dopisuje AuditStep do werdyktu. Pierwsza porażka
-gate'a kończy pipeline werdyktem STAND_DOWN.
+Mapa weighted_score → SetupGrade:
+    >= 1.0R   → A
+    >= 0.5R   → B
+    >= 0.3R   → C  (watch only)
+    <  0.3R   → NONE → STAND_DOWN
+
+Master nie haltuje przy CHAOS/UNKNOWN regime — placeholdery regime/mtf
+są rejestrowane jako warning, ale weighted_decision jest źródłem prawdy.
 """
 from __future__ import annotations
 
@@ -19,7 +24,7 @@ from datetime import datetime
 
 from master.config import MasterConfig
 from master.core import (
-    edge_lookup,
+    decision as decision_mod,
     gates,
     mtf,
     plan as plan_mod,
@@ -30,6 +35,7 @@ from master.core import (
 from master.core.verdict import (
     AuditStep,
     SetupGrade,
+    Side,
     Verdict,
     VerdictState,
 )
@@ -41,6 +47,17 @@ from master.monitor.tail import TailMonitor
 log = logging.getLogger(__name__)
 
 
+def _grade_from_score(score: float) -> SetupGrade:
+    """Map weighted_score (in R-multiples) to SetupGrade."""
+    if score >= 1.0:
+        return SetupGrade.A
+    if score >= 0.5:
+        return SetupGrade.B
+    if score >= 0.3:
+        return SetupGrade.C
+    return SetupGrade.NONE
+
+
 def run_pipeline(cfg: MasterConfig) -> Verdict:
     """Wykonuje pełen pipeline i zwraca werdykt."""
 
@@ -50,13 +67,13 @@ def run_pipeline(cfg: MasterConfig) -> Verdict:
         state=VerdictState.STAND_DOWN,
     )
 
-    # Inicjalizacja komponentów (lekka, lazy gdzie się da)
+    # Inicjalizacja komponentów
     fs = FeatureStore(cfg)
     journal = JournalDb(cfg.journal_db)
     psych = PsychMonitor(cfg, journal)
     tail = TailMonitor(cfg)
 
-    # ─── 1. Pre-checks ───
+    # ─── 1. Pre-checks (HARD GATE) ───
     pre = gates.precheck(cfg, fs, psych, tail)
     verdict.audit.append(AuditStep("pre-checks", pre.passed, pre.detail))
     verdict.psych_state = pre.psych_state
@@ -68,76 +85,83 @@ def run_pipeline(cfg: MasterConfig) -> Verdict:
         log.info("Pipeline halted at pre-checks: %s", pre.detail)
         return verdict
 
-    # ─── 2. Regime ───
-    regime_result = regime_mod.classify(cfg, fs)
-    verdict.regime = regime_result.regime
+    # ─── 2. Weighted Decision (PRIMARY) ───
+    wd = decision_mod.compute_weighted_decision(fs)
+
+    # Zapisz do extras dla UI/audit
+    verdict.extras["weighted_score"] = wd.weighted_score
+    verdict.extras["weighted_direction"] = wd.direction
+    verdict.extras["weighted_long"] = wd.weighted_long
+    verdict.extras["weighted_short"] = wd.weighted_short
+    verdict.extras["fade_count"] = wd.fade_count
+    verdict.extras["sources_active"] = wd.n_sources_with_edge
+    verdict.extras["contributing"] = wd.contributing
+
+    # Set expected_r i sample_size z weighted decision
+    verdict.expected_r = wd.weighted_score if wd.direction != "FLAT" else 0.0
+    verdict.sample_size = wd.n_sources_with_edge
+
+    # Set setup grade
+    verdict.setup_grade = _grade_from_score(wd.weighted_score)
+
+    decision_passed = wd.weighted_score >= decision_mod.DEFAULT_DECISION_THRESHOLD \
+                      and wd.direction != "FLAT"
+
     verdict.audit.append(AuditStep(
-        "regime classified",
-        regime_result.regime.value != "CHAOS",
-        f"{regime_result.regime.value} (adx={regime_result.adx:.1f})",
+        "weighted decision",
+        decision_passed,
+        f"{wd.direction} {wd.weighted_score:+.2f}R "
+        f"(sources={wd.n_sources_with_edge}, fade={wd.fade_count}, "
+        f"flat-skipped={wd.flat_skipped})",
     ))
-    if regime_result.regime.value == "CHAOS":
+
+    if not decision_passed:
+        log.info("Pipeline halted at weighted_decision: score=%.3f dir=%s",
+                 wd.weighted_score, wd.direction)
         return verdict
 
-    # ─── 3. MTF align ───
-    mtf_result = mtf.align(cfg, fs)
-    verdict.mtf_score = mtf_result.weighted_score
-    passed = mtf_result.weighted_score >= cfg.mtf.no_trade_threshold
-    verdict.audit.append(AuditStep(
-        "mtf align",
-        passed,
-        f"{mtf_result.weighted_score:.1f}/9 ({mtf_result.summary})",
-    ))
-    if not passed:
-        return verdict
+    # Set side z weighted direction
+    side = Side.LONG if wd.direction == "LONG" else Side.SHORT
+    verdict.plan.side = side
 
-    # ─── 4. Setup grade ───
-    grade_result = setup_grader.grade(cfg, fs, regime_result, mtf_result)
-    verdict.setup_grade = grade_result.grade
-    passed = grade_result.grade in (SetupGrade.A, SetupGrade.B)
-    verdict.audit.append(AuditStep(
-        "setup grade",
-        passed,
-        f"{grade_result.grade.value} ({grade_result.factors_passed}/5 factors)",
-    ))
-    if not passed:
-        return verdict
-
-    # ─── 5. Edge lookup ───
-    edge_result = edge_lookup.lookup(cfg, journal, regime_result, grade_result)
-    verdict.expected_r = edge_result.expected_r
-    verdict.sample_size = edge_result.sample_size
-    passed = edge_result.tradeable
-    verdict.audit.append(AuditStep(
-        "edge lookup",
-        passed,
-        f"E={edge_result.expected_r:+.2f}R, n={edge_result.sample_size}"
-        if edge_result.expected_r is not None else "no historical data",
-    ))
-    if not passed:
-        return verdict
-
-    # WATCH: setup się kwalifikuje, ale czekamy na trigger cenowy
-    verdict.state = VerdictState.WATCH
-
-    # ─── 6. Position sizing ───
-    sizing = sizer_mod.size(cfg, fs, grade_result, edge_result)
-    verdict.audit.append(AuditStep(
-        "position sizing",
-        sizing.contracts > 0,
-        f"size={sizing.contracts}, risk={sizing.risk_eur:.2f} EUR",
-    ))
-
-    # ─── 7. Trade plan ───
-    plan = plan_mod.build(cfg, fs, regime_result, sizing)
-    verdict.plan = plan
-    if plan.entry is not None:
+    # ─── 3. Regime (informacyjnie, nie haltuje) ───
+    try:
+        regime_result = regime_mod.classify(cfg, fs)
+        verdict.regime = regime_result.regime
         verdict.audit.append(AuditStep(
-            "trade plan",
-            True,
-            f"entry={plan.entry:.4f}, sl={plan.stop_loss:.4f}",
+            "regime classified",
+            regime_result.regime.value not in ("CHAOS", "UNKNOWN"),
+            f"{regime_result.regime.value} (adx={regime_result.adx:.1f})",
         ))
-        # READY: plan jest gotowy, oczekujemy że cena go aktywuje
-        verdict.state = VerdictState.READY
+    except Exception as e:
+        log.warning("regime.classify failed: %s", e)
+        verdict.audit.append(AuditStep(
+            "regime classified", False,
+            f"skipped: {type(e).__name__}: {e}",
+        ))
+
+    # ─── 4. MTF align (informacyjnie, nie haltuje) ───
+    try:
+        mtf_result = mtf.align(cfg, fs)
+        verdict.mtf_score = mtf_result.weighted_score
+        verdict.audit.append(AuditStep(
+            "mtf align",
+            mtf_result.weighted_score >= cfg.mtf.no_trade_threshold,
+            f"{mtf_result.weighted_score:.1f}/9 ({mtf_result.summary})",
+        ))
+    except Exception as e:
+        log.warning("mtf.align failed: %s", e)
+        verdict.audit.append(AuditStep(
+            "mtf align", False,
+            f"skipped: {type(e).__name__}: {e}",
+        ))
+
+    # WATCH: setup się kwalifikuje, ale brak konkretnego entry/SL bez ATR
+    if verdict.setup_grade in (SetupGrade.A, SetupGrade.B):
+        verdict.state = VerdictState.WATCH
+
+    # ─── 5/6. Sizing + Plan (wymaga ATR/spot — guarded) ───
+    # TODO commit #5: integracja z EA price feed (spot + ATR z TF1m/5m)
+    # Dla READY potrzebujemy entry/SL/TP — bez tego zostajemy w WATCH.
 
     return verdict
