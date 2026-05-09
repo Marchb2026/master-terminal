@@ -43,37 +43,39 @@ def test_verdict_render():
     assert "TREND_UP_WEAK" in out
 
 
-def test_journal_roundtrip():
-    """Trade → DB → trade roundtrip."""
+def test_journal_roundtrip(tmp_path):
+    """Trade → DB → trade roundtrip.
+
+    Używa pytest fixture `tmp_path` zamiast tempfile.TemporaryDirectory,
+    bo TemporaryDirectory ma problem na Windowsie z SQLite file locks
+    nawet z ignore_cleanup_errors=True.
+    """
     from master.journal.db import JournalDb
     from master.journal.trade import Trade
 
-    # ignore_cleanup_errors=True bo Windows trzyma uchwyt do .db plików
-    # przez chwilę po zamknięciu connection (znana cecha Windows + SQLite)
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        db_path = Path(tmp) / "test_journal.db"
-        journal = JournalDb(db_path)
+    db_path = tmp_path / "test_journal.db"
+    journal = JournalDb(db_path)
 
-        trade = Trade(
-            trade_id="test_1",
-            template_id="TEST_LONG_A",
-            opened_at=datetime(2026, 5, 9, 10, 0),
-            closed_at=datetime(2026, 5, 9, 11, 0),
-            entry_price=1.1580,
-            exit_price=1.1605,
-            stop_loss=1.1565,
-            side="LONG",
-            contracts=1.0,
-            risk_eur=100.0,
-            pnl_eur=180.0,
-            r_multiple=1.8,
-            setup_grade="A",
-        )
-        journal.insert(trade)
+    trade = Trade(
+        trade_id="test_1",
+        template_id="TEST_LONG_A",
+        opened_at=datetime(2026, 5, 9, 10, 0),
+        closed_at=datetime(2026, 5, 9, 11, 0),
+        entry_price=1.1580,
+        exit_price=1.1605,
+        stop_loss=1.1565,
+        side="LONG",
+        contracts=1.0,
+        risk_eur=100.0,
+        pnl_eur=180.0,
+        r_multiple=1.8,
+        setup_grade="A",
+    )
+    journal.insert(trade)
 
-        retrieved = journal.get_trades_by_template("TEST_LONG_A")
-        assert len(retrieved) == 1
-        assert retrieved[0].r_multiple == 1.8
+    retrieved = journal.get_trades_by_template("TEST_LONG_A")
+    assert len(retrieved) == 1
+    assert retrieved[0].r_multiple == 1.8
 
 
 def test_expectancy():
@@ -160,6 +162,23 @@ def test_feature_store_methods_exist():
     ]
     for m in expected_methods:
         assert hasattr(FeatureStore, m), f"Missing method: {m}"
+
+
+def test_parse_ts_handles_all_formats():
+    """Regresja: _ts z forecast cache bywa stringiem ISO, bywa floatem epoch.
+    Master musi obsłużyć oba bez TypeError przy `now - ts`.
+    """
+    from master.data.feature_store import FeatureStore
+
+    assert FeatureStore._parse_ts(1778319813.5) == 1778319813.5
+    assert FeatureStore._parse_ts(1778319813) == 1778319813.0
+    parsed = FeatureStore._parse_ts("2026-05-09T11:43:33")
+    assert parsed is not None and isinstance(parsed, float)
+    parsed_z = FeatureStore._parse_ts("2026-05-09T11:43:33Z")
+    assert parsed_z is not None and isinstance(parsed_z, float)
+    assert FeatureStore._parse_ts(None) is None
+    assert FeatureStore._parse_ts("not a date") is None
+    assert FeatureStore._parse_ts("") is None
 
 
 if __name__ == "__main__":

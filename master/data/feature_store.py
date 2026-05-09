@@ -168,6 +168,24 @@ class FeatureStore:
             log.warning("JSON read failed %s: %s", path.name, e)
             return None
 
+    @staticmethod
+    def _parse_ts(val) -> float | None:
+        """Parse timestamp z dowolnego formatu: float epoch, int epoch, ISO string.
+
+        EA czasem zapisuje `_ts` jako string '2026-05-09T11:43:33', czasem jako
+        epoch. Master jest defensywny.
+        """
+        if val is None:
+            return None
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, str):
+            try:
+                return datetime.fromisoformat(val.replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError):
+                return None
+        return None
+
     # ─────────── LIVE: composite + modules (forecast cache) ───────────
 
     def read_composite(self) -> CompositeSignal | None:
@@ -183,7 +201,7 @@ class FeatureStore:
             n_active=int(data.get("n_active", 0)),
             n_total=int(data.get("n_total", 0)),
             votes=dict(data.get("votes", {})),
-            ts=data.get("_ts"),
+            ts=self._parse_ts(data.get("_ts")),
         )
 
     def read_module(self, module_id: str) -> ModuleSignal | None:
@@ -412,7 +430,7 @@ class FeatureStore:
             top_strikes=data.get("top_strikes", []) or [],
             n_contracts=int(data.get("n_contracts", 0) or 0),
             connected=bool(data.get("connected", False)),
-            ts=data.get("ts"),
+            ts=self._parse_ts(data.get("ts")),
         )
 
     def read_options_history(self, n: int = 20) -> list[dict]:
