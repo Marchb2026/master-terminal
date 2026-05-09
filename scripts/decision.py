@@ -46,6 +46,7 @@ class WeightedDecision:
     fade_count: int = 0
     raw_count: int = 0
     n_sources_with_edge: int = 0
+    flat_skipped: int = 0     # ile FLAT/zero-conf placeholderów pominięto
 
 
 def compute_weighted_decision(
@@ -58,8 +59,9 @@ def compute_weighted_decision(
 ) -> WeightedDecision:
     """Liczy weighted decision dla aktualnego stanu rynku."""
 
-    # 1. Najnowsze sygnały (bez filtra confidence — bierzemy wszystko)
-    recent = fs.read_recent_signals(since_minutes=since_minutes)
+    # 1. Najnowsze sygnały (bez filtra confidence — bierzemy wszystko, filtr robimy poniżej)
+    # Wysoki limit żeby objąć wszystkie source mimo FLAT placeholderów EA.
+    recent = fs.read_recent_signals(since_minutes=since_minutes, limit=5000)
 
     # 2. Edge per source (rolling window)
     sources = fs.get_top_sources(
@@ -74,11 +76,20 @@ def compute_weighted_decision(
     contributing: dict[str, float] = {}
     seen: set[str] = set()
     fade_count = 0
+    flat_skipped = 0
 
     for sig in recent:
-        # Każdy source głosuje raz (bierzemy najnowszy sygnał)
+        # Każdy source głosuje raz (bierzemy najnowszy realny sygnał)
         if sig.source in seen:
             continue
+
+        # SKIP "no signal" placeholders — EA zapisuje co kilka sekund rekordy
+        # z direction=FLAT i confidence=0 jako proof-of-life. To nie są decyzje
+        # tradingowe, tylko status updates. Idziemy dalej do najnowszego realnego.
+        if sig.direction == "FLAT" or sig.confidence <= 0.0:
+            flat_skipped += 1
+            continue
+
         seen.add(sig.source)
 
         # Brak danych historycznych = ignorujemy
@@ -140,6 +151,7 @@ def compute_weighted_decision(
         fade_count=fade_count,
         raw_count=len(recent),
         n_sources_with_edge=len(seen),
+        flat_skipped=flat_skipped,
     )
 
 
@@ -203,8 +215,9 @@ def main() -> int:
         print("  unavailable")
 
     print()
-    print(f"Weighted Decision  (sygnałów: {decision.raw_count}, "
-          f"unikalnych source: {decision.n_sources_with_edge}, "
+    print(f"Weighted Decision  (sygnałów raw: {decision.raw_count}, "
+          f"FLAT/zero-conf pominięto: {decision.flat_skipped}, "
+          f"realnych source: {decision.n_sources_with_edge}, "
           f"fade'owanych: {decision.fade_count}):")
     print(f"  direction:       {decision.direction}")
     print(f"  weighted_score:  {decision.weighted_score:+.3f}R")

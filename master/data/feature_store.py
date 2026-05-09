@@ -238,6 +238,7 @@ class FeatureStore:
         since_minutes: int = 30,
         source: str | None = None,
         only_unresolved: bool = False,
+        limit: int = 2000,
     ) -> list[SignalRow]:
         cutoff_ts = time.time() - since_minutes * 60
         sql = "SELECT * FROM signals WHERE ts >= ?"
@@ -247,7 +248,8 @@ class FeatureStore:
             params.append(source)
         if only_unresolved:
             sql += " AND resolved = 0"
-        sql += " ORDER BY ts DESC LIMIT 500"
+        sql += " ORDER BY ts DESC LIMIT ?"
+        params.append(limit)
 
         try:
             with self._connect_ro(self.cfg.ea_signals_db) as conn:
