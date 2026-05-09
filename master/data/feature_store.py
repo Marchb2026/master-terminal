@@ -476,6 +476,58 @@ class FeatureStore:
             return []
         return [dict(r) for r in rows]
 
+    # ─────────── Spot + Volatility (dla sizer / plan) ───────────
+
+    def get_current_spot(self, since_minutes: int = 30) -> float | None:
+        """Najnowszy spot z signals_unified (ostatni rekord w oknie).
+
+        Bez prawdziwego TF feedu, używamy spot field z najnowszego sygnału EA
+        jako proxy aktualnej ceny. Działa dobrze gdy EA aktywnie loguje.
+        """
+        recent = self.read_recent_signals(since_minutes=since_minutes, limit=1)
+        if recent:
+            return recent[0].spot
+        return None
+
+    def estimate_atr_pips(
+        self,
+        since_minutes: int = 60,
+        pip_size: float = 0.0001,
+        min_samples: int = 5,
+    ) -> float | None:
+        """Estymuje ATR z kolejnych spotów w sygnałach.
+
+        Mechanizm: bierze unikalne spoty (po quantyzacji do minuty),
+        liczy mean(abs(delta)) — to nie jest dokładny ATR (Wilder),
+        ale dobry proxy zmienności gdy EA pisze co kilka sekund.
+
+        Returns:
+            ATR w pips, albo None gdy za mało danych.
+        """
+        recent = self.read_recent_signals(since_minutes=since_minutes, limit=2000)
+        if len(recent) < min_samples:
+            return None
+
+        # Quantize do minuty żeby unikać duplikatów z tego samego ts
+        spots: list[float] = []
+        seen_minutes: set[int] = set()
+        # `recent` jest DESC po ts, odwracamy żeby chronologicznie
+        for sig in reversed(recent):
+            minute_bucket = int(sig.ts) // 60
+            if minute_bucket in seen_minutes:
+                continue
+            seen_minutes.add(minute_bucket)
+            spots.append(sig.spot)
+
+        if len(spots) < min_samples:
+            return None
+
+        deltas = [abs(spots[i + 1] - spots[i]) for i in range(len(spots) - 1)]
+        if not deltas:
+            return None
+        avg_delta = sum(deltas) / len(deltas)
+        return avg_delta / pip_size
+
     # ─────────── Freshness ───────────
 
     def check_freshness(self, max_age_seconds: int = 120) -> FreshnessResult:

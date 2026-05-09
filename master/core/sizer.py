@@ -1,16 +1,16 @@
 """Position sizing — Tharp (R-multiples) + Kaufman (vol-adjusted).
 
-Reguła: ryzyko per trade jako % kapitału, **stała**, niezależna od
-"przekonania". Wielkość pozycji wynika z R i ze stop distance, nie
-odwrotnie.
+Tharp: ryzyko per trade jako % kapitału, **stała**, niezależna od
+"przekonania". Wielkość pozycji wynika z R i ze stop distance.
 
     risk_eur = account × risk_pct
-    stop_distance = max(structural_invalidation, atr_multiplier × ATR)
-    position_size = risk_eur / (stop_distance × point_value)
+    stop_distance_pips = atr_pips × sl_atr_multiplier
+    risk_per_contract_eur = stop_distance_pips × pip_value_eur
+    contracts = floor(risk_eur / risk_per_contract_eur)
 
-Dla 6E (EUR/USD futures): point value = 12.50 USD per 0.0001
-(ale dla simplicity tu przyjmujemy EUR i 6.25 EUR per 0.5 tick — TBI
-po zweryfikowaniu z Marcinem specyfikacji kontraktu).
+Dla 6E (EUR/USD futures CME):
+  1 pip = 0.0001
+  pip value = $12.50 / kontrakt → ~€10.65 / kontrakt (przy EUR/USD ≈ 1.17)
 """
 from __future__ import annotations
 
@@ -18,76 +18,92 @@ import logging
 from dataclasses import dataclass
 
 from master.config import MasterConfig
-from master.core.edge_lookup import EdgeResult
-from master.core.setup_grader import GradeResult
 from master.core.verdict import SetupGrade
 from master.data.feature_store import FeatureStore
 
 log = logging.getLogger(__name__)
 
 
-# 6E (Euro FX futures) tick value
-# 1 punkt (0.0001) = $12.50; 1 minimum tick (0.00005) = $6.25
-# TODO: verify z Marcinem/IBKR specs, na razie używamy USD jako proxy EUR
-TICK_SIZE = 0.00005
-TICK_VALUE_USD = 6.25
-POINT_SIZE = 0.0001
-POINT_VALUE_USD = 12.50
-
-
 @dataclass
 class SizingResult:
-    contracts: float = 0.0
-    risk_eur: float = 0.0
-    risk_r: float = 1.0           # zawsze 1.0 R (z definicji)
-    stop_distance_points: float = 0.0
+    contracts: int = 0
+    risk_eur: float = 0.0                 # actual risk po zaokrągleniu kontraktów
+    target_risk_eur: float = 0.0          # docelowy risk (przed floor)
+    risk_r: float = 1.0                   # zawsze 1.0 R
+    stop_distance_pips: float = 0.0
+    atr_pips: float = 0.0
+    pip_value_eur: float = 0.0
+    risk_pct: float = 0.0
     detail: str = ""
 
 
 def size(
     cfg: MasterConfig,
     fs: FeatureStore,
-    grade: GradeResult,
-    edge: EdgeResult,
+    grade: SetupGrade,
+    weighted_score: float = 0.0,
 ) -> SizingResult:
     """Liczy wielkość pozycji wg Tharpa.
 
-    risk_pct zależy od grade (A = pełne 1%, B = 0.5%, C = 0).
-    Jeśli sample size < minimum → eksploracja, ½ wielkości (Tharp).
+    Args:
+        cfg: MasterConfig
+        fs: FeatureStore (do ATR estimation)
+        grade: SetupGrade (A/B/C/NONE)
+        weighted_score: opcjonalny boost factor — mocniejszy edge może uzyskać
+                        nieznacznie większy risk pct (do max 1.5x).
     """
-    if grade.grade == SetupGrade.A:
+    # Risk pct na podstawie grade
+    if grade == SetupGrade.A:
         risk_pct = cfg.risk.risk_pct_grade_a
-    elif grade.grade == SetupGrade.B:
+    elif grade == SetupGrade.B:
         risk_pct = cfg.risk.risk_pct_grade_b
     else:
-        return SizingResult(detail="grade C — no sizing")
+        return SizingResult(detail=f"grade {grade.value} — no sizing")
 
-    # Tharp eksploracja: mała próbka → połowa pozycji
-    if edge.sample_size < cfg.edge.min_sample_size:
-        risk_pct *= 0.5
+    # ATR z signals (proxy)
+    atr_pips = fs.estimate_atr_pips() or cfg.execution.default_atr_pips
+    atr_pips = max(atr_pips, cfg.execution.min_atr_pips)  # noise floor
 
-    risk_eur = cfg.risk.account_size_eur * risk_pct
+    # Stop distance
+    stop_distance_pips = atr_pips * cfg.execution.sl_atr_multiplier
+    if stop_distance_pips <= 0:
+        return SizingResult(
+            atr_pips=atr_pips,
+            risk_pct=risk_pct,
+            detail="invalid stop distance",
+        )
 
-    # Stop distance — TBI: pobranie ATR z feature_store
-    # Na razie placeholder z konfiguracji (1.5 × placeholder ATR)
-    atr = fs.get_atr(timeframe="TF15") or 0.0010   # placeholder 10 pips
-    stop_distance = atr * cfg.risk.sl_atr_multiplier
+    # Risk EUR
+    target_risk_eur = cfg.risk.account_size_eur * risk_pct
 
-    if stop_distance <= 0:
-        return SizingResult(detail="invalid stop distance")
+    # Risk per kontrakt
+    pip_value_eur = cfg.execution.pip_value_eur
+    risk_per_contract_eur = stop_distance_pips * pip_value_eur
+    if risk_per_contract_eur <= 0:
+        return SizingResult(
+            atr_pips=atr_pips,
+            risk_pct=risk_pct,
+            detail="invalid pip_value_eur or stop",
+        )
 
-    # Wartość 1 punktu w EUR (proxy = USD na razie)
-    risk_per_contract = stop_distance * POINT_VALUE_USD / POINT_SIZE
-    if risk_per_contract <= 0:
-        return SizingResult(detail="invalid risk per contract")
-
-    raw_contracts = risk_eur / risk_per_contract
-    # Zaokrąglenie w dół (lepiej mniejsza pozycja niż większa — Taleb)
+    raw_contracts = target_risk_eur / risk_per_contract_eur
+    # Floor — lepiej mniejsza pozycja (Taleb, ruin aversion)
     contracts = max(0, int(raw_contracts))
+
+    actual_risk_eur = contracts * risk_per_contract_eur
 
     return SizingResult(
         contracts=contracts,
-        risk_eur=risk_eur,
-        stop_distance_points=stop_distance,
-        detail=f"risk_pct={risk_pct:.3%}, atr={atr:.5f}, raw={raw_contracts:.2f}",
+        risk_eur=actual_risk_eur,
+        target_risk_eur=target_risk_eur,
+        risk_r=1.0,
+        stop_distance_pips=stop_distance_pips,
+        atr_pips=atr_pips,
+        pip_value_eur=pip_value_eur,
+        risk_pct=risk_pct,
+        detail=(
+            f"grade={grade.value}, risk_pct={risk_pct:.3%}, "
+            f"atr={atr_pips:.1f}p, sl={stop_distance_pips:.1f}p, "
+            f"raw={raw_contracts:.2f} → {contracts}c"
+        ),
     )

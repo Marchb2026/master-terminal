@@ -311,5 +311,153 @@ def test_wfa_small_drop_still_stable():
     assert es.stable is True
 
 
+# ───────── Execution layer tests (commit #6) ─────────
+
+def test_execution_config_present():
+    """ExecutionConfig musi mieć wszystkie pola wymagane przez sizer/plan."""
+    from master.config import CONFIG
+
+    e = CONFIG.execution
+    assert e.pip_size == 0.0001
+    assert e.pip_value_eur > 0
+    assert e.sl_atr_multiplier > 0
+    assert e.tp1_r_multiple > 0
+    assert e.tp2_r_multiple > e.tp1_r_multiple
+    assert e.invalidation_minutes > 0
+
+
+def test_sizer_a_grade_calculation():
+    """A-grade z 10k EUR account, 1% risk, ATR 15p, SL 1.5×ATR = 22.5p stop.
+    Risk per kontrakt = 22.5p × 10.65 EUR/p = 239.6 EUR. 100 EUR / 239.6 = 0.42 → 0 contracts.
+    Z 100k account = 1000 EUR / 239.6 = 4.17 → 4 kontrakty.
+    """
+    from master.config import MasterConfig, RiskConfig, ExecutionConfig
+    from master.core.sizer import size, SizingResult
+    from master.core.verdict import SetupGrade
+
+    cfg = MasterConfig()
+    cfg.risk = RiskConfig(account_size_eur=100_000.0, risk_pct_grade_a=0.010)
+    cfg.execution = ExecutionConfig()  # defaults: ATR 15p, SL 1.5x, pip 10.65 EUR
+
+    class MockFs:
+        def estimate_atr_pips(self, **kwargs): return 15.0
+
+    result = size(cfg, MockFs(), SetupGrade.A, weighted_score=1.2)
+    assert result.contracts >= 1
+    assert result.risk_eur > 0
+    assert result.stop_distance_pips == 15.0 * 1.5
+
+
+def test_sizer_grade_c_returns_zero():
+    """Grade C → no sizing (Tharp: nie tradujemy słabych setupów)."""
+    from master.config import CONFIG
+    from master.core.sizer import size
+    from master.core.verdict import SetupGrade
+
+    class MockFs:
+        def estimate_atr_pips(self, **kwargs): return 15.0
+
+    result = size(CONFIG, MockFs(), SetupGrade.C)
+    assert result.contracts == 0
+    assert "no sizing" in result.detail.lower() or "grade c" in result.detail.lower()
+
+
+def test_plan_long_geometry():
+    """LONG plan: SL pod entry, TP1/TP2 nad entry, R = stop_distance."""
+    from master.config import CONFIG
+    from master.core.plan import build
+    from master.core.regime import RegimeResult
+    from master.core.sizer import SizingResult
+    from master.core.verdict import Regime, Side
+
+    sizing = SizingResult(
+        contracts=2, risk_eur=200.0, target_risk_eur=200.0,
+        stop_distance_pips=20.0, atr_pips=13.3, pip_value_eur=10.65,
+    )
+    regime = RegimeResult(regime=Regime.TREND_UP_WEAK)
+
+    class MockFs:
+        def get_current_spot(self, **kwargs): return 1.1580
+
+    plan = build(CONFIG, MockFs(), regime, sizing, Side.LONG)
+    assert plan.entry == 1.1580
+    assert plan.stop_loss < plan.entry           # SL pod entry
+    assert plan.take_profit_1 > plan.entry       # TP1 nad entry
+    assert plan.take_profit_2 > plan.take_profit_1  # TP2 dalej niż TP1
+    # R distance = 20 pips × 0.0001 = 0.002
+    assert abs((plan.entry - plan.stop_loss) - 0.0020) < 1e-9
+    # TP1 = entry + 1.5R = entry + 0.003
+    assert abs((plan.take_profit_1 - plan.entry) - 0.003) < 1e-9
+
+
+def test_plan_short_geometry():
+    """SHORT plan: SL nad entry, TP1/TP2 pod entry."""
+    from master.config import CONFIG
+    from master.core.plan import build
+    from master.core.regime import RegimeResult
+    from master.core.sizer import SizingResult
+    from master.core.verdict import Regime, Side
+
+    sizing = SizingResult(
+        contracts=2, risk_eur=200.0, target_risk_eur=200.0,
+        stop_distance_pips=20.0, atr_pips=13.3, pip_value_eur=10.65,
+    )
+    regime = RegimeResult(regime=Regime.TREND_DN_WEAK)
+
+    class MockFs:
+        def get_current_spot(self, **kwargs): return 1.1580
+
+    plan = build(CONFIG, MockFs(), regime, sizing, Side.SHORT)
+    assert plan.entry == 1.1580
+    assert plan.stop_loss > plan.entry
+    assert plan.take_profit_1 < plan.entry
+    assert plan.take_profit_2 < plan.take_profit_1
+
+
+def test_plan_zero_contracts_returns_empty():
+    """contracts=0 → pusty plan, nie crash."""
+    from master.config import CONFIG
+    from master.core.plan import build
+    from master.core.regime import RegimeResult
+    from master.core.sizer import SizingResult
+    from master.core.verdict import Regime, Side
+
+    sizing = SizingResult(contracts=0)
+    regime = RegimeResult(regime=Regime.RANGE)
+
+    class MockFs:
+        def get_current_spot(self, **kwargs): return 1.1580
+
+    plan = build(CONFIG, MockFs(), regime, sizing, Side.LONG)
+    assert plan.entry is None
+    assert plan.position_size_contracts is None or plan.position_size_contracts == 0
+
+
+def test_regime_blocks_long_in_strong_downtrend():
+    """TREND_DN_STRONG nie pozwala na long."""
+    from master.core.regime import regime_allows_long, regime_allows_short
+    from master.core.verdict import Regime
+
+    assert regime_allows_long(Regime.TREND_DN_STRONG) is False
+    assert regime_allows_short(Regime.TREND_DN_STRONG) is True
+    assert regime_allows_long(Regime.TREND_UP_STRONG) is True
+    assert regime_allows_long(Regime.RANGE) is True
+    assert regime_allows_long(Regime.CHAOS) is False
+
+
+def test_regime_classify_returns_unknown_with_no_data():
+    """Bez composite i bez signals → UNKNOWN, no crash."""
+    from master.config import CONFIG
+    from master.core.regime import classify, RegimeResult
+
+    class MockFs:
+        def read_composite(self): return None
+        def estimate_atr_pips(self, **kwargs): return None
+        def read_recent_signals(self, **kwargs): return []
+
+    result = classify(CONFIG, MockFs())
+    assert result.regime.value == "UNKNOWN"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -119,6 +119,37 @@ class EdgeConfig:
     min_sample_size: int = 30       # mniej niż 30 trade'ów → tryb eksploracji (½ size)
 
 
+# ─────────── Execution (Tharp + Faith) ───────────
+
+@dataclass
+class ExecutionConfig:
+    """Parametry konkretnego TradePlanu — entry, SL, TP, sizing.
+
+    Faith Turtle: SL = 1.5 ATR, TP1 = 1.5R (50% pozycji = lock 0.75R),
+    TP2 = 3R (kolejne 30%), runner trailing dla 20%.
+    """
+    pip_size: float = 0.0001            # FX 6E: 1 pip = 0.0001
+    pip_value_eur: float = 10.65         # 6EM26: $12.50 / 1.17 EUR/USD ≈ €10.65 per pip per kontrakt
+
+    # ATR estimation
+    default_atr_pips: float = 15.0       # fallback gdy brak danych (typical 1m vol)
+    min_atr_pips: float = 5.0            # nie pozwalaj na ekstremalnie ciasny SL (noise)
+
+    # Stop / target multipliers (Faith Turtle)
+    sl_atr_multiplier: float = 1.5       # SL = 1.5 × ATR
+    tp1_r_multiple: float = 1.5          # TP1 przy 1.5R (lock niewielki zysk)
+    tp2_r_multiple: float = 3.0          # TP2 przy 3R (Faith: let winners run)
+    trailing_atr_multiplier: float = 2.0  # trailing dla runnera
+
+    # Position split
+    tp1_size_fraction: float = 0.5       # 50% pozycji na TP1
+    tp2_size_fraction: float = 0.3       # 30% na TP2
+    runner_size_fraction: float = 0.2    # 20% trailing runner
+
+    # Plan invalidation
+    invalidation_minutes: int = 60       # jeśli setup nie aktywuje się w 60min, anuluj
+
+
 # ─────────── Tail risk / blackout ───────────
 
 @dataclass
@@ -142,6 +173,7 @@ class MasterConfig:
     grader: GraderConfig = field(default_factory=GraderConfig)
     edge: EdgeConfig = field(default_factory=EdgeConfig)
     tail: TailConfig = field(default_factory=TailConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 
     instrument: str = INSTRUMENT
     tz_offset_hours: int = TIMEZONE_OFFSET_HOURS
