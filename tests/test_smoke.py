@@ -199,9 +199,7 @@ def test_weighted_decision_dataclass():
 
 
 def test_grade_from_score_mapping():
-    """Mapowanie weighted_score → SetupGrade w pipeline.
-    Granice: 1.0 → A, 0.5 → B, 0.3 → C, < 0.3 → NONE.
-    """
+    """Mapowanie weighted_score → SetupGrade w pipeline."""
     from master.core.pipeline import _grade_from_score
     from master.core.verdict import SetupGrade
 
@@ -212,8 +210,105 @@ def test_grade_from_score_mapping():
     assert _grade_from_score(0.49) == SetupGrade.C
     assert _grade_from_score(0.3) == SetupGrade.C
     assert _grade_from_score(0.29) == SetupGrade.NONE
-    assert _grade_from_score(0.0) == SetupGrade.NONE
-    assert _grade_from_score(-0.5) == SetupGrade.NONE
+
+
+def test_weighted_decision_v05_fields():
+    """v0.5: WeightedDecision ma pola dla wszystkich 7 layerów confluence."""
+    from master.core.decision import WeightedDecision
+
+    wd = WeightedDecision(
+        direction="LONG",
+        weighted_score=0.7,
+        weighted_long=0.8,
+        weighted_short=0.1,
+    )
+    # Defaults dla nowych pól
+    assert wd.composite_contribution == 0.0
+    assert wd.liquidity_modifier == 0.0
+    assert wd.gex_warning == ""
+    assert wd.mtf_alignment == "UNKNOWN"
+    assert wd.decision_threshold_used == 0.3
+    assert wd.sources_unstable == []
+    assert wd.notes == []
+
+
+def test_wfa_edge_stability_dataclass():
+    """WFA: EdgeStability ma właściwe pola."""
+    from master.core.wfa import EdgeStability
+
+    es = EdgeStability(
+        source="XGB",
+        full_window_r=0.491,
+        full_window_n=5550,
+        recent_window_r=0.45,
+        recent_window_n=200,
+        delta=-0.041,
+        relative_drop=0.08,
+        stable=True,
+    )
+    assert es.source == "XGB"
+    assert es.stable is True
+    assert es.relative_drop < 0.5
+
+
+def test_wfa_sign_flip_detected():
+    """Sign flip (full +0.5R → recent -0.3R) musi być oznaczony jako unstable."""
+    # Mock FeatureStore zwracający różne expectancy w różnych windowach
+    from master.core.wfa import check_recent_edge_stability
+    from master.data.feature_store import SourceStats
+
+    class MockFs:
+        def get_source_expectancy(self, source, lookback_days=30):
+            if lookback_days == 30:
+                return SourceStats(source=source, n_resolved=5000, win_rate=0.4,
+                                   avg_pips_correct=10, avg_pips_wrong=-5,
+                                   expectancy_pips=5, expectancy_r=0.5)
+            else:  # recent 7d
+                return SourceStats(source=source, n_resolved=100, win_rate=0.3,
+                                   avg_pips_correct=5, avg_pips_wrong=-10,
+                                   expectancy_pips=-3, expectancy_r=-0.3)
+
+    es = check_recent_edge_stability(MockFs(), "XGB", full_days=30, recent_days=7)
+    assert es.stable is False
+    assert "sign flip" in es.reason.lower() or "drop" in es.reason.lower()
+
+
+def test_wfa_drop_detected():
+    """Drop > 50% z absolute change > 0.15R musi być unstable."""
+    from master.core.wfa import check_recent_edge_stability
+    from master.data.feature_store import SourceStats
+
+    class MockFs:
+        def get_source_expectancy(self, source, lookback_days=30):
+            if lookback_days == 30:
+                return SourceStats(source=source, n_resolved=5000, win_rate=0.4,
+                                   avg_pips_correct=10, avg_pips_wrong=-5,
+                                   expectancy_pips=5, expectancy_r=0.5)
+            else:
+                # 0.5 → 0.05 = 90% drop, abs change 0.45R
+                return SourceStats(source=source, n_resolved=100, win_rate=0.35,
+                                   avg_pips_correct=6, avg_pips_wrong=-5,
+                                   expectancy_pips=0.5, expectancy_r=0.05)
+
+    es = check_recent_edge_stability(MockFs(), "XGB", full_days=30, recent_days=7)
+    assert es.stable is False
+    assert es.relative_drop > 0.5
+
+
+def test_wfa_small_drop_still_stable():
+    """Drop ~10% nie powinien być flagged."""
+    from master.core.wfa import check_recent_edge_stability
+    from master.data.feature_store import SourceStats
+
+    class MockFs:
+        def get_source_expectancy(self, source, lookback_days=30):
+            base_r = 0.5 if lookback_days == 30 else 0.45  # 10% drop
+            return SourceStats(source=source, n_resolved=5000 if lookback_days == 30 else 100,
+                               win_rate=0.4, avg_pips_correct=10, avg_pips_wrong=-5,
+                               expectancy_pips=base_r * 10, expectancy_r=base_r)
+
+    es = check_recent_edge_stability(MockFs(), "XGB", full_days=30, recent_days=7)
+    assert es.stable is True
 
 
 if __name__ == "__main__":

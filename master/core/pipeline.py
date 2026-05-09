@@ -96,6 +96,14 @@ def run_pipeline(cfg: MasterConfig) -> Verdict:
     verdict.extras["fade_count"] = wd.fade_count
     verdict.extras["sources_active"] = wd.n_sources_with_edge
     verdict.extras["contributing"] = wd.contributing
+    # v0.5 confluence layers
+    verdict.extras["composite_contribution"] = wd.composite_contribution
+    verdict.extras["liquidity_modifier"] = wd.liquidity_modifier
+    verdict.extras["gex_warning"] = wd.gex_warning
+    verdict.extras["mtf_alignment"] = wd.mtf_alignment
+    verdict.extras["decision_threshold_used"] = wd.decision_threshold_used
+    verdict.extras["sources_unstable"] = wd.sources_unstable
+    verdict.extras["decision_notes"] = wd.notes
 
     # Set expected_r i sample_size z weighted decision
     verdict.expected_r = wd.weighted_score if wd.direction != "FLAT" else 0.0

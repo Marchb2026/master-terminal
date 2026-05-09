@@ -1,101 +1,138 @@
-"""Walk-forward analysis — Pardo (*Evaluation and Optimization of Trading Strategies*).
+"""Walk-Forward Analysis — Pardo's robustness check.
 
-Cel: comiesięczna sanity-check edge'ów per template setupu.
-Czy A-setupy wciąż mają E > 0.5R w ostatnim oknie out-of-sample?
-Jeśli nie — alert, że reżim się zmienił, system przestał działać.
+Pytanie: czy historical edge per source utrzymuje się w niedawnej przeszłości?
+Jeśli XGB miał +0.491R w 30d window ale tylko +0.05R w ostatnim 7d,
+jego edge wycieka i nie powinniśmy mu już ufać.
 
-Bez WFA każdy backtest jest curve-fittingiem. Pardo: "the only test that
-matters is the one performed on data the system never saw during design".
+Pardo (Evaluation and Optimization of Trading Strategies):
+- Backtest na 3+ niezależnych windowach
+- Out-of-sample validation
+- Edge musi być stabilny — pojedyncze runy nie liczą się
+
+Master używa uproszczonej wersji: rolling-window stability.
+Recent edge musi być w granicach delta_threshold od full-window edge.
 """
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 
-from master.journal.db import JournalDb
-from master.journal.stats import compute_expectancy
-
-log = logging.getLogger(__name__)
+from master.data.feature_store import FeatureStore
 
 
 @dataclass
-class WfaWindow:
-    template_id: str
-    window_start: datetime
-    window_end: datetime
-    sample_size: int
-    expectancy_r: float
-    win_rate: float
-    profit_factor: float
-    decay_alert: bool = False
+class EdgeStability:
+    """Wynik check_recent_edge_stability dla pojedynczego source."""
+
+    source: str
+    full_window_r: float          # E w pełnym window (np. 30d)
+    full_window_n: int
+    recent_window_r: float        # E w recent window (np. 7d)
+    recent_window_n: int
+    delta: float                  # recent_window_r - full_window_r
+    relative_drop: float          # |delta| / max(|full|, 0.1)
+    stable: bool                  # czy w granicach tolerancji
+    reason: str = ""
 
 
-@dataclass
-class WfaReport:
-    windows: list[WfaWindow]
-    alerts: list[str]
+def check_recent_edge_stability(
+    fs: FeatureStore,
+    source: str,
+    full_days: int = 30,
+    recent_days: int = 7,
+    delta_threshold: float = 0.5,    # 50% drop = unstable
+    min_recent_n: int = 20,
+) -> EdgeStability:
+    """Sprawdza stabilność edge'u dla source w rolling window.
 
+    Args:
+        fs: FeatureStore (do queries)
+        source: nazwa source (XGB, vote_SCORE, etc.)
+        full_days: window do reference edge
+        recent_days: niedawny window do porównania
+        delta_threshold: max relative drop (0.5 = 50%)
+        min_recent_n: min sample size w recent — poniżej zwraca stable=True
 
-def run_wfa(
-    journal: JournalDb,
-    template_ids: list[str],
-    window_days: int = 30,
-    n_windows: int = 6,
-    alert_threshold_r: float = 0.0,
-) -> WfaReport:
-    """Liczy expectancy w n_windows kolejnych okien po window_days.
-
-    Alert gdy najnowsze okno ma E poniżej alert_threshold_r LUB gdy
-    monotoniczny spadek E przez >= 3 ostatnie okna (edge decay).
+    Returns:
+        EdgeStability — stable=True jeśli recent edge zgodny z full,
+        False jeśli wyciek edge'u przekracza delta_threshold.
     """
-    now = datetime.now()
-    windows: list[WfaWindow] = []
-    alerts: list[str] = []
+    full = fs.get_source_expectancy(source, lookback_days=full_days)
+    recent = fs.get_source_expectancy(source, lookback_days=recent_days)
 
-    for template in template_ids:
-        per_template_windows: list[WfaWindow] = []
+    # Brak danych: stable=True (nie blokuj decyzji)
+    if not full or not recent:
+        return EdgeStability(
+            source=source,
+            full_window_r=full.expectancy_r if full else 0.0,
+            full_window_n=full.n_resolved if full else 0,
+            recent_window_r=recent.expectancy_r if recent else 0.0,
+            recent_window_n=recent.n_resolved if recent else 0,
+            delta=0.0,
+            relative_drop=0.0,
+            stable=True,
+            reason="insufficient data",
+        )
 
-        for i in range(n_windows):
-            end = now - timedelta(days=i * window_days)
-            start = end - timedelta(days=window_days)
+    # Recent ma za mało próbek: nie blokuj
+    if recent.n_resolved < min_recent_n:
+        return EdgeStability(
+            source=source,
+            full_window_r=full.expectancy_r,
+            full_window_n=full.n_resolved,
+            recent_window_r=recent.expectancy_r,
+            recent_window_n=recent.n_resolved,
+            delta=recent.expectancy_r - full.expectancy_r,
+            relative_drop=0.0,
+            stable=True,
+            reason=f"recent n={recent.n_resolved} < min {min_recent_n}",
+        )
 
-            trades = journal.get_trades_by_template(
-                template,
-                start=start,
-                end=end,
-            )
-            if not trades:
-                continue
+    delta = recent.expectancy_r - full.expectancy_r
+    base = max(abs(full.expectancy_r), 0.1)
+    relative_drop = abs(delta) / base
 
-            stats = compute_expectancy(trades)
-            w = WfaWindow(
-                template_id=template,
-                window_start=start,
-                window_end=end,
-                sample_size=len(trades),
-                expectancy_r=stats.expectancy_r,
-                win_rate=stats.win_rate,
-                profit_factor=stats.profit_factor,
-            )
-            per_template_windows.append(w)
-            windows.append(w)
+    # Edge SIGNIFICANTLY worse w recent? Unstable.
+    # Two ways to be unstable:
+    #  (a) recent edge spadł o więcej niż threshold (drop)
+    #  (b) recent zmienił znak vs full (sign flip)
+    sign_flip = (full.expectancy_r > 0.1 and recent.expectancy_r < -0.1) or \
+                (full.expectancy_r < -0.1 and recent.expectancy_r > 0.1)
 
-        # Edge decay detection
-        if per_template_windows:
-            latest = per_template_windows[0]
-            if latest.expectancy_r < alert_threshold_r:
-                latest.decay_alert = True
-                alerts.append(
-                    f"{template}: latest E={latest.expectancy_r:+.2f}R "
-                    f"below threshold {alert_threshold_r:+.2f}R"
-                )
+    if sign_flip:
+        stable = False
+        reason = f"sign flip ({full.expectancy_r:+.2f}R → {recent.expectancy_r:+.2f}R)"
+    elif relative_drop > delta_threshold and abs(delta) > 0.15:
+        # Drop >50% AND absolute change >0.15R (żeby 0.05→0.02 nie liczyło)
+        stable = False
+        reason = f"drop {relative_drop:.0%} (>{delta_threshold:.0%})"
+    else:
+        stable = True
+        reason = f"stable (delta {delta:+.2f}R, drop {relative_drop:.0%})"
 
-            if len(per_template_windows) >= 3:
-                last3 = per_template_windows[:3]
-                if all(last3[j].expectancy_r > last3[j + 1].expectancy_r for j in range(2)):
-                    alerts.append(
-                        f"{template}: monotonic E decay over last 3 windows"
-                    )
+    return EdgeStability(
+        source=source,
+        full_window_r=full.expectancy_r,
+        full_window_n=full.n_resolved,
+        recent_window_r=recent.expectancy_r,
+        recent_window_n=recent.n_resolved,
+        delta=delta,
+        relative_drop=relative_drop,
+        stable=stable,
+        reason=reason,
+    )
 
-    return WfaReport(windows=windows, alerts=alerts)
+
+def check_top_sources_stability(
+    fs: FeatureStore,
+    full_days: int = 30,
+    recent_days: int = 7,
+    min_samples: int = 50,
+) -> dict[str, EdgeStability]:
+    """Sprawdza stabilność top source'ów. Używane do diagnostyki / dashboard."""
+    sources = fs.get_top_sources(lookback_days=full_days, min_samples=min_samples)
+    return {
+        s.source: check_recent_edge_stability(
+            fs, s.source, full_days=full_days, recent_days=recent_days
+        )
+        for s in sources
+    }
